@@ -6,7 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "einops>=0.8.2",
     "gym-pusht>=0.1.6",
-    "lerobot>=0.6.1",
+    "lerobot[dataset]>=0.6.1",
     "matplotlib>=3.11.2",
     "numpy>=2.2.6",
     "pymunk<7.0",
