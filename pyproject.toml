@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Small project to get hands dirty working on robotics-like data and sims."
 requires-python = ">=3.13"
 dependencies = [
+    "diffusers>=0.40.0",
     "einops>=0.8.2",
     "gym-pusht>=0.1.6",
     "lerobot[dataset]>=0.6.1",
