@@ -3,15 +3,19 @@ import torch
 from torch.utils.data import Dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+import logging
+logging.getLogger("lerobot.utils.import_utils").setLevel(logging.ERROR) 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 
 def split_episodes(
-        repo_id: str, 
         val_frac: float = 0.1, 
         seed: int = 0
     ) -> tuple[list[int], list[int]]:
 
     """Episode level splitting for train and validation."""
-    data = LeRobotDataset(repo_id) 
+    data = LeRobotDataset("lerobot/pusht_keypoints") 
 
     n_episodes = data.num_episodes
     episode_ids = list(range(n_episodes))
@@ -26,7 +30,13 @@ def split_episodes(
 
 
 class PushTKeypointsDataset(Dataset):
-    def __init__(self, episodes: list[int], to_steps: int = 2, tp_steps: int = 16, fps: int = 10) -> None:
+    def __init__(
+            self, 
+            episodes: list[int], 
+            obs_horizon: int = 2, 
+            pred_horizon: int = 16, fps: int = 10, 
+            preload: bool = False
+        ) -> None:
         """
         Training data for PushT task, where observations comes from fixed keypoints on T.
         """
@@ -44,20 +54,19 @@ class PushTKeypointsDataset(Dataset):
         #       "observation.environment_state" : [-0.1, 0.0]            (current and previous To-1)
         #       "action"                        : [0.0, 0.1, ..., 1.5]   (current and next Tp-1)
         delta_timestamps = {
-            "observation.state": [-i * dt for i in reversed(range(to_steps))],
-            "observation.environment_state": [-i * dt for i in reversed(range(to_steps))],
-            "action": [i * dt for i in range(tp_steps)],
+            "observation.state": [-i * dt for i in reversed(range(obs_horizon))],
+            "observation.environment_state": [-i * dt for i in reversed(range(obs_horizon))],
+            "action": [i * dt for i in range(pred_horizon)],
         }
         self.data = LeRobotDataset(
             "lerobot/pusht_keypoints",
             episodes=episodes,
             delta_timestamps=delta_timestamps,
         )
+        self._preloaded_data = self._preload_dataset() if preload else None
 
-    def __len__(self) -> int:
-        return len(self.data)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.tensor]:
+    def _load_item(self, idx: int) -> dict[str, torch.tensor]:
         item = self.data[idx]
 
         # Joining the state of the robot (i.e. current location) with the state of the env (i.e. the 
@@ -81,3 +90,26 @@ class PushTKeypointsDataset(Dataset):
             "actions": future_actions_torch, 
             "is_actions_pad": is_future_actions_pad
         }
+
+
+    def _preload_dataset(self) -> dict[str, torch.Tensor]:
+        """Preloads all dataset items into memory and stacks them into tensors."""
+        logger.info('Preloading data...')
+        
+        accumulated_elems = {}
+        for idx in range(len(self.data)):
+            for key, tensor in self._load_item(idx).items():
+                accumulated_elems.setdefault(key, []).append(tensor)
+
+        logger.info('Preloading complete.')
+        return {key: torch.stack(tensors) for key, tensors in accumulated_elems.items()}
+
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+
+    def __getitem__(self, idx: int) -> dict[str, torch.tensor]:
+        if self._preloaded_data is not None:
+            return {key: tensor[idx] for key, tensor in self._preloaded_data.items()}
+        return self._load_item(idx)
