@@ -89,10 +89,37 @@ class DiffusionConfig:
 
 
 @dataclass
+class TrainConfig:
+    batch_size: int = 256
+    lr: float = 1e-4
+    betas: tuple[float, float] = (0.95, 0.999)
+    weight_decay: float = 1e-6
+    grad_clip: float | None = None
+    num_steps: int = 50_000
+    lr_warmup_steps: int = 500
+    ema_power: float = 0.75
+    ema_max_decay: float = 0.9999
+    seed: int = 0
+    device: str = "auto"
+ 
+    # data loading
+    cache_dataset: bool = True
+    num_workers: int = 0
+ 
+    # bookkeeping (in optimizer steps)
+    out_dir: str = "runs/baseline"
+    log_every: int = 50
+    val_every: int = 1000
+    val_max_batches: int | None = None
+    ckpt_every: int = 5000
+
+
+@dataclass
 class Config:
     data: DataConfig = field(default_factory=DataConfig)
     unet: UNetConfig = field(default_factory=UNetConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
  
     def __post_init__(self) -> None:
         pred_horizon = self.data.pred_horizon
@@ -110,7 +137,8 @@ class Config:
     @classmethod
     def from_dict(cls, plain_dict: dict) -> "Config":
         return cls(
-            data=DataConfig(**plain_dict["data"]),
-            unet=UNetConfig(**plain_dict["unet"]),
-            diffusion=DiffusionConfig(**plain_dict["diffusion"])
+            data=DataConfig(**plain_dict.get("data", {})),
+            unet=UNetConfig(**plain_dict.get("unet", {})),
+            diffusion=DiffusionConfig(**plain_dict.get("diffusion", {})),
+            train=TrainConfig(**plain_dict.get("train", {}))
         )
