@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
+import copy
 
 
 @dataclass
@@ -115,11 +116,31 @@ class TrainConfig:
 
 
 @dataclass
+class FixedReplanningConfig:
+    action_horizon: int = 8
+    action_horizon_sweep: tuple[int, ...] = (2, 4, 6, 8, 12, 16)
+
+
+@dataclass
+class ReplanningConfig:
+    default_strategy: str = "fixed" 
+    fixed: FixedReplanningConfig = field(default_factory=FixedReplanningConfig)
+
+    @classmethod
+    def from_dict(cls, plain_dict: dict) -> ReplanningConfig:
+        return cls(
+            default_strategy=plain_dict.get("default_strategy", "fixed"),
+            fixed=FixedReplanningConfig(**plain_dict.get("fixed", {}))
+        )
+
+
+@dataclass
 class Config:
     data: DataConfig = field(default_factory=DataConfig)
     unet: UNetConfig = field(default_factory=UNetConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    replanning: ReplanningConfig = field(default_factory=ReplanningConfig)
  
     def __post_init__(self) -> None:
         pred_horizon = self.data.pred_horizon
@@ -135,10 +156,24 @@ class Config:
         return asdict(self)
  
     @classmethod
-    def from_dict(cls, plain_dict: dict) -> "Config":
+    def from_dict(cls, plain_dict: dict) -> Config:
         return cls(
             data=DataConfig(**plain_dict.get("data", {})),
             unet=UNetConfig(**plain_dict.get("unet", {})),
             diffusion=DiffusionConfig(**plain_dict.get("diffusion", {})),
-            train=TrainConfig(**plain_dict.get("train", {}))
+            train=TrainConfig(**plain_dict.get("train", {})),
+            replanning=ReplanningConfig.from_dict(plain_dict.get("replanning", {}))
         )
+
+    @classmethod
+    def from_checkpoint_with_override(cls, base_dict: dict, override_dict: dict) -> Config:
+        def _deep_update(d, u):
+            for k, v in u.items():
+                if isinstance(v, dict) and k in d and isinstance(d[k], dict):
+                    _deep_update(d[k], v)
+                else:
+                    d[k] = v
+    
+        merged_dict = copy.deepcopy(base_dict)
+        _deep_update(merged_dict, override_dict)
+        return cls.from_dict(merged_dict)
