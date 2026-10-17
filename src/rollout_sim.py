@@ -21,6 +21,7 @@ from config import Config, DiffusionConfig
 from diffusion import DiffusionPolicy
 from replanning import ReplanningStrategy, FixedReplanning
 from train import load_policy, set_all_seeds
+from rollout_trace import RolloutTraceRecorder, get_rollout_trace_path
 
 import logging
 logger = logging.getLogger(__name__)
@@ -105,17 +106,31 @@ def run_rollout_sim(
     policy: DiffusionPolicy,
     rule: ReplanningStrategy,
     cfg: Config,
-    seed: int,
+    environment_seed: int,
+    diffusion_seed: int,
+    strategy_name: str,
+    traces_out_dir: Path | None = None,
     max_steps: int = MAX_ROLLOUT_STEPS,
 ) -> RolloutMetrics:
     
     # New generator each rollout so the noise stream is a function of the seed only
-    generator = torch.Generator().manual_seed(seed)
+    generator = torch.Generator().manual_seed(diffusion_seed)
     device = policy.device
 
-    env_obs, _ = env.reset(seed=seed)
+    env_obs, _ = env.reset(seed=environment_seed)
     previous_obs_context = ObservationContext(cfg.data.obs_horizon)
     previous_obs_context.init_rollout(format_sim_observations(env_obs, cfg))
+
+    recorder = RolloutTraceRecorder(
+        environment_seed=environment_seed,
+        diffusion_seed=diffusion_seed,
+        strategy_name=strategy_name,
+        n_samples=getattr(rule, "n_samples", 1),
+        num_inference_steps=policy.num_inference_steps,
+        max_steps=max_steps
+    )
+    recorder.record_env_step(observation=format_sim_observations(env_obs, cfg), 
+                             action=np.zeros(2, dtype=np.float32), coverage=0.0)
 
     n_total_steps = 0
     n_planning_cycles = 0
@@ -137,6 +152,8 @@ def run_rollout_sim(
         n_planning_cycles += 1
         n_actions_per_planning_cycle.append(n_actions_to_take)
 
+        recorder.record_replan_event(step=n_total_steps, action_horizon=n_actions_to_take, samples=planned_actions.cpu().numpy())
+
         for action in action_sequence_taken:
             action = np.clip(action, cfg.data.box_lo, cfg.data.box_hi)
             env_obs, step_reward, terminated, truncated, _ = env.step(action)
@@ -145,14 +162,21 @@ def run_rollout_sim(
             n_total_steps += 1
             max_coverage_score = max(max_coverage_score, float(step_reward))
 
+            recorder.record_env_step(observation=format_sim_observations(env_obs, cfg), action=action, coverage=float(step_reward))
+
             if terminated:
                 success = True
             if terminated or truncated or n_total_steps >= max_steps:
                 done = True
                 break
 
+    recorder.success = success
+    if traces_out_dir is not None:
+        trace_path = get_rollout_trace_path(traces_out_dir, environment_seed, diffusion_seed)
+        recorder.save(trace_path)
+
     return RolloutMetrics(
-            seed=seed, 
+            seed=environment_seed, 
             success=success, 
             n_total_steps=n_total_steps, 
             n_planning_cycles=n_planning_cycles,
@@ -186,24 +210,35 @@ def run_rollout_batch(
     policy: DiffusionPolicy,
     rule: ReplanningStrategy,
     cfg: Config,
-    seeds: list[int],
+    environment_seeds: list[int],
     rule_name: str,
+    traces_out_dir: Path,
     verbose: bool = True,
+    n_diffusion_seeds: int = 1,
+    max_steps: int = MAX_ROLLOUT_STEPS
 ) -> tuple[RolloutBatchSummary, list[RolloutMetrics]]:
+    
     logger.info("Starting batch rollouts...")
-    env = make_simulation_env()
+    env = make_simulation_env(max_steps)
     validate_env_config_alignment(env, cfg)
 
     results = []
-    for i, seed in enumerate(seeds):
-        rollout_result = run_rollout_sim(env, policy, rule, cfg, seed)
-        results.append(rollout_result)
+    total_runs = len(environment_seeds) * n_diffusion_seeds
+    run_idx = 0
 
-        if verbose:
-            wins = sum(x.success for x in results)
-            logger.info(f"[{rule_name}] rollout {i + 1:>3}/{len(seeds)}  seed={seed}  "
-                  f"{'OK  ' if rollout_result.success else 'fail'}  steps={rollout_result.n_total_steps:>3}  cycles={rollout_result.n_planning_cycles:>3}  "
-                  f"max_cov={rollout_result.max_coverage_score:.2f}  running success={wins / len(results):.0%}")
+    for i, environment_seed in enumerate(environment_seeds):
+        for j in range(n_diffusion_seeds):
+            run_idx += 1
+            diffusion_seed = environment_seed + 1_000_000 * j
+
+            rollout_result = run_rollout_sim(env, policy, rule, cfg, environment_seed, diffusion_seed, rule_name, traces_out_dir, max_steps)
+            results.append(rollout_result)
+
+            if verbose:
+                wins = sum(x.success for x in results)
+                logger.info(f"[{rule_name}] rollout {run_idx:>3}/{total_runs}  env_seed={environment_seed}   diff_seed={diffusion_seed}   "
+                    f"{'OK  ' if rollout_result.success else 'fail'}  steps={rollout_result.n_total_steps:>3}  cycles={rollout_result.n_planning_cycles:>3}  "
+                    f"max_cov={rollout_result.max_coverage_score:.2f}  running success={wins / len(results):.0%}")
     env.close()
     logger.info("Batch rollouts complete.")
 
@@ -332,18 +367,25 @@ def main() -> None:
     seeds = [args.seed0 + i for i in range(args.n_rollouts)]
     out_dir = Path(args.ckpt).parent / "rollouts"
     out_dir.mkdir(exist_ok=True)
+
+    
     
     for rule, rule_name in replanning_strategies_to_run:
         logger.info(f"Evaluating {rule_name}:")
+        
+        traces_out_dir = out_dir / "traces" / f"{rule_name}_{sampler_tag}_n{args.n_rollouts}"
+        traces_out_dir.mkdir(parents=True, exist_ok=True)
+        
         summary, rollouts = run_rollout_batch(
             policy=policy, 
             rule=rule, 
             cfg=cfg, 
-            seeds=seeds, 
-            rule_name=rule_name
+            environment_seeds=seeds, 
+            rule_name=rule_name,
+            traces_out_dir=traces_out_dir
         )
         log_batch_summary(summary)
-        
+
         save_path = out_dir / f"{rule_name}_{sampler_tag}_n{args.n_rollouts}.json"
         metadata = {
             "ckpt": str(args.ckpt), 
